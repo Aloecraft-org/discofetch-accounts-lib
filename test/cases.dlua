@@ -42,7 +42,7 @@ end
 local function int_param(v)
   local n = tonumber(v)
   if not n or n ~= math.floor(n) then return nil end
-  return n
+  return math.floor(n)
 end
 
 -- The connector. Routes are matched as plain substrings, first one wins, so
@@ -125,15 +125,29 @@ local function as_token(db, role, tier)
 end
 
 -- token-rate-limit-lib. POLICIES lands on the instance the way it would
--- through the library's own __index.
+-- through the library's own __index, and the policy tables are spelled
+-- per_hour/burst because that is what the real one asserts on.
+--
+-- check() RETURNS THE REFUSAL AS ONE TABLE -- true on allow, `false, refusal`
+-- on deny, where refusal carries status/code/message/body/headers/wait. This
+-- double returned a status/body/headers triple once, which is not the shape
+-- the library has, and the arity mismatch it hid is exactly what a double
+-- that agrees with its consumer instead of with its subject costs.
 local function mkrate()
-  local rl = { POLICIES = { redeem = { 30, 10 }, authfail = { 30, 10 } }, calls = {} }
+  local rl = { POLICIES = { redeem  = { per_hour = 30, burst = 10 },
+                            authfail = { per_hour = 30, burst = 10 } }, calls = {} }
   function rl:check(key, policy, what)
     self.calls[#self.calls + 1] = { key = key, policy = policy, what = what }
     if self.deny then
-      return false, 429,
-        { error = { code = 'rate_limited', message = what .. '; retry in 7s' } },
-        { ['retry-after'] = '7', ['cache-control'] = 'no-store' }
+      local message = what .. '; retry in 7s'
+      return false, {
+        status  = 429,
+        code    = 'rate_limited',
+        message = message,
+        body    = { error = { code = 'rate_limited', message = message } },
+        headers = { ['retry-after'] = '7', ['cache-control'] = 'no-store' },
+        wait    = 7,
+      }
     end
     return true
   end

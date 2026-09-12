@@ -1709,11 +1709,16 @@ function Account:redeem_post(req, p)
   -- this library derives the key and spends the bucket on every attempt,
   -- success included, and nothing more.
   local who = (req.real_ip and req.real_ip ~= '') and req.real_ip or nil
-  local okr, rs, rp, rh = self.rate:check(
+  -- check() hands the refusal back as ONE table, not as a status/body/headers
+  -- triple: the limiter serves two doors that take it differently -- fail(conn,
+  -- status, code, message, headers) on the fetchpoint side, a returned triple
+  -- here -- so it returns the parts assembled and lets each door pick. Unpacked
+  -- as three values instead, the status becomes the table and the body nil.
+  local okr, refusal = self.rate:check(
     who and ('redeem:' .. who) or 'redeem:unknown',
     self.rate.POLICIES.redeem,
     'too many redemption attempts from this address')
-  if not okr then return rs, rp, rh end
+  if not okr then return refusal.status, refusal.body, refusal.headers end
 
   local body = {}
   if req.body and req.body ~= '' then

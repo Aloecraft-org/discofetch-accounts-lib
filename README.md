@@ -117,9 +117,13 @@ ROUTES['GET /v1/me'] = function(req, p) return accounts:me_get(req, p) end
 local per_hour = Accounts.tier_of(owner.tier).dns_per_hour
 ```
 
-`rate:check` is expected to answer `true` when allowed, and
-`false, 429, {error = {code = 'rate_limited', message = ...}}, headers` when
-not. This library derives the key (`redeem:<x-real-ip>`, or `redeem:unknown`
+`rate:check` answers `true` when allowed, and `false, refusal` when not —
+**one table**, carrying `status` / `code` / `message` / `body` / `headers` /
+`wait`. It is assembled rather than split because the limiter serves two doors
+that take it differently: `fail(conn, status, code, message, headers)` on the
+fetchpoint side, a returned `status, body, headers` triple here. Unpacked as a
+triple instead, the status would be the table and the body nil.
+This library derives the key (`redeem:<x-real-ip>`, or `redeem:unknown`
 — never a header the caller can seed), spends the bucket on every attempt
 including the successful ones, and returns the refusal on through. It never
 converts units and never names the numbers.
