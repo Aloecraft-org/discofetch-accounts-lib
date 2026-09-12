@@ -1,0 +1,1868 @@
+-- discofetch-accounts-lib -- identity and entitlement.
+--
+-- Who is asking (a gateway session assertion, or an opaque token), whose
+-- face they are wearing (act-as), what their plan allows (tiers and
+-- grants), and how a stranger becomes a customer (invites). Extracted from
+-- api/supervisor.lua with the arithmetic, the branch order and every
+-- refusal code unchanged; the comments came with them, because they are
+-- what the code costs to re-derive.
+--
+-- THE IDENTITY MODEL, once, because nothing below restates it. `x-df-sub`
+-- is the GATEWAY'S ASSERTION, and it is trustworthy for exactly one reason:
+-- the gateway strips every inbound `x-df-` header and re-adds it after
+-- verifying the token itself. `act-as` sits DELIBERATELY OUTSIDE that
+-- namespace -- nothing about its name suggests it was checked, because
+-- nothing checked it before this library did. It is honoured only for
+-- admins arriving on a session, and for everybody else it is REFUSED with
+-- an honest 403 rather than ignored: a caller who believes they are acting
+-- as a customer and is in fact acting as an ADMIN is the most dangerous of
+-- the three possible outcomes.
+--
+-- Nothing `require`s this file yet -- DRT guests have no `require` and no
+-- `dofile` -- which is expected. The last statement is `return M` so the
+-- day the load-time modules slice ships, consumption is two lines. Until
+-- then the test harness concatenates (see test/run.sh).
+
+local M = {}
+
+-- ============================================================ the surface
+--
+-- (1) ENTRY POINTS
+--
+-- PURE -- no db, no clock, no host -- and therefore plain fields:
+--   M.tier_of(name)                  the registry lookup; free on a miss
+--   M.role_rank(name)                the rank ladder; 0 on a miss
+--   M.opaque_token(authorization)    the token grammar, strictly
+--   M.token_row(r)                   a token as the API shows it (no hash)
+--   M.grant_live_sql(t)              when a gift counts, spelled once
+--   M.invite_live_sql(t)             when a code counts, spelled once
+--   M.validate_grant(spec, t)        what a grant may say, for both doors
+--   M.validate_invite_fields(b, t)   note/max_uses/expires_at, both doors
+--   M.invite_prefix(code)            the only spelling of a code that may
+--                                    reach an event row or a grant source
+--   M.require_session(req, why)      WHICH CREDENTIAL arrived
+--   M.require_own_account(req, why)  WHOSE FACE is on
+--   M.resolve_actor(actor)           the acted_by unwrap -- handed to
+--                                    node-event-lib as its resolve_actor,
+--                                    which is the only reason that generic
+--                                    library never learns the word
+--
+-- BOUND -- db, clock, json, crypto, the sibling libraries -- and therefore
+-- reached through M.new(deps), which returns an instance:
+--   :account_by_token(secret)  :resolve_account(req)  :act_as_apply(req, caller)
+--   :quota_of(acct)  :grants_of(id, t)  :grant_insert(id, g, source, t)
+--   :grant_object(r) :grant_by_id(id, t) :apply_confers(acct, raw, src, t, addr)
+--   :invite_json(r)  :invite_insert(created_by, f, confers_json, t)
+--   :require_role(req, min)  :require_admin(req)  :require_person(req, min, why)
+--   :me_body(req, acct)
+--   handlers, all (req, p) -> status, payload [, headers]:
+--     :me_get :me_patch :grants_redeem
+--     :tokens_list :tokens_create :tokens_delete
+--     :invites_list :invites_create :invites_delete :redeem_post
+--
+-- M.new(deps) -- every dep required, every one asserted by name, because a
+-- missing dep must be a sentence at construction and never a nil deref on
+-- somebody's create:
+--   db      the sql connector handle (query / exec / try_exec)
+--   now     a function returning unix SECONDS. NEVER host.time() in here:
+--           the schema is seconds throughout and the composition root is
+--           the only place that knows the host answers milliseconds
+--   json    encode / decode
+--   ready   a PREDICATE -> ready, error_sentence. Never a captured boolean:
+--           the flag flips after migrate() runs, and a snapshot taken at
+--           construction freezes false and answers 503 forever
+--   crypto  random(bytes) -> hex, hash(secret) -> stored digest
+--   drtdb   drt-db-lib: rows_by_name
+--   model   discofetch-model-lib: base32_from_hex (the token and code draws)
+--   http    drt-http-api-lib: int_param
+--   events  node-event-lib instance: :log(kind, subject, actor, f), :last(...)
+--   rate    token-rate-limit-lib instance: :check(key, policy, what) and
+--           .POLICIES.redeem. One dep, not two -- an accounts-lib holding a
+--           raw bucket would silently bypass the policy table
+--
+-- (2) CONFIGURABLE VALUES -- declared here and nowhere else in this file.
+
+-- The token grammar. `dfp_live_` is part of the secret rather than
+-- decoration: it is what lets the GATEWAY tell an opaque token from a JWT
+-- without parsing either (haproxy.cfg, is_opaque_token), and what lets a
+-- leaked credential be recognised in a log or a repository scan as ours.
+M.TOKEN_PREFIX = 'dfp_live_'
+M.TOKEN_BYTES  = 20               -- 160 bits, the same draw as a label
+
+-- A code is `dfi_` plus 16 base32 symbols -- 80 bits from the CSPRNG, the
+-- label's math, and long enough that GUESSING IS NOT THE ATTACK: the redeem
+-- limiter exists for the day that assumption is wrong, not instead of it.
+-- Codes are NOT hashed, unlike tokens, and that is a decision: the minter
+-- has to read their own codes back to send them, and a code is an entry
+-- ticket with a use count, not a standing credential to an account.
+M.INVITE_PREFIX   = 'dfi_'
+M.INVITE_BYTES    = 10            -- 80 bits, 16 symbols, the label's math
+M.INVITE_MAX_USES = 10
+M.INVITE_LIST     = 100           -- comfortably under the connector's 256
+
+M.GRANT_QUANTITY_MAX = 100000     -- a bonus larger than this is a typo
+
+-- LIMITed for the reason every list here is: the connector REFUSES past its
+-- row cap rather than truncating, so an account with three hundred grants
+-- would answer 500 on the page it is most important to load.
+M.ACCOUNT_GRANTS = 50
+-- The ceiling on how many live grants one account's quota arithmetic will
+-- read. Not a business rule -- grants arrive one at a time from an operator
+-- -- but the connector: max_result_rows REFUSES past 256 rather than
+-- truncating, so an unbounded SELECT here would turn a generous account
+-- into a 500 on every create.
+M.QUOTA_GRANT_ROWS = 100
+M.TOKEN_LIST       = 100
+
+M.ACT_AS_EVENT_EVERY = 300        -- seconds between impersonate.start rows
+-- Five-minute resolution on last_seen_at and last_used_at, per
+-- doc/DATA-MODEL.md 4: updating them on every request turns every read into
+-- a write, and the panel does not need better. Interpolated into the one
+-- statement that needs it rather than bound -- it is an integer this
+-- program computed, never a caller's value (grant_live_sql's argument).
+M.SEEN_COARSE = 300
+
+M.MINT_ATTEMPTS   = 8             -- draws before a code claim gives up
+M.NOTE_MAX        = 120           -- an invite note
+M.TOKEN_NAME_MAX  = 120           -- a token name; optional, unlike a fetchpoint's
+M.REDEEM_CODE_MAX = 64            -- longer than a code: not a code
+M.EMAIL_MIN, M.EMAIL_MAX = 3, 254
+
+-- THE REFUSAL SENTENCES. Up here because a human reads them -- they are the
+-- product's voice -- and because `why` is passed through require_session
+-- and require_own_account for one reason: there are several rules behind
+-- each code, and a refusal explaining the wrong one sends the reader to
+-- debug something that was never in their way.
+M.SESSION_MINT =
+  'tokens cannot mint or revoke tokens; sign in to manage them'
+M.TOKEN_ACT_AS_MINT =
+  'a token minted while acting as somebody else outlives the window that '
+  .. 'made it, is indistinguishable from the owner\'s own afterwards, and '
+  .. 'has to be revoked by somebody remembering to; mint it as yourself'
+M.TOKEN_ACT_AS_REVOKE =
+  'revoking is the other half of minting, and acting as somebody else '
+  .. 'reaches neither; ask them to revoke it, or sign in as yourself'
+M.ME_PATCH_ACT_AS =
+  'PATCH /v1/me sets the account holder\'s own contact address and is '
+  .. 'refused while acting as them; ask them to set it'
+-- SESSION ONLY: accepting a gift is a decision a person makes, and a bearer
+-- secret sitting in a CI job is not a person. AND NOT WHILE WEARING
+-- SOMEBODY'S FACE: a window that can consent on a customer's behalf makes
+-- the timestamp meaningless. It joins minting and revoking on the short
+-- list of things impersonation may not reach, for the same reason -- it
+-- OUTLIVES the window.
+M.GRANT_SESSION =
+  'accepting a grant is something the account holder does, not something a '
+  .. 'credential does: sign in and accept it from the panel'
+M.GRANT_ACT_AS =
+  'accepting a grant is the account holder\'s decision and it outlives the '
+  .. 'window you are in; ask them to accept it'
+M.INVITE_SESSION =
+  'minting and revoking invite codes needs a signed-in session: a code is a '
+  .. 'door into the product, and a bearer secret in an env file must not be '
+  .. 'able to hand out access the account holder never chose'
+M.INVITE_ACT_AS =
+  'a code minted while acting as somebody else outlives the window and keeps '
+  .. 'opening the door afterwards, wearing the account holder\'s name; ask '
+  .. 'them to mint it'
+M.INVITE_REVOKE_ACT_AS =
+  'revoking is minting run backwards and acting as somebody else reaches '
+  .. 'neither; an admin revokes any code as themselves, through this same '
+  .. 'endpoint, without the header'
+-- ONE ANSWER FOR FOUR REFUSALS. Missing, revoked, expired and exhausted are
+-- deliberately indistinguishable from outside: the caller is unauthenticated
+-- in every way that matters (a verified identity with no account is anybody
+-- with a Google login), and "real but expired" tells a guesser their
+-- dictionary is warm. The person with a genuinely lapsed code learns why
+-- from whoever gave it to them -- who can read it off GET /v1/invites.
+M.INVITE_INVALID = { error = { code = 'invalid_code',
+  message = 'that code cannot be redeemed: it does not exist, or it has '
+    .. 'expired, been revoked, or been used up' } }
+-- Every token failure answers the SAME 401 with the same sentence: revoked,
+-- expired, never existed, belongs to a deleted account. Distinguishing them
+-- would tell someone holding a stolen token which of those it is, and there
+-- is no case where the holder needs to know and the panel cannot say better.
+M.TOKEN_INVALID = { error = { code = 'unauthenticated',
+                              message = 'that token is not valid' } }
+-- Suspension closes the CONTROL PLANE -- the panel, the API, this row --
+-- and nothing else. A suspended account's FetchPoints keep serving, on
+-- purpose: a billing dispute that silently takes down somebody's home
+-- network is an incident rather than a collection strategy, and
+-- serve_fetchpoint deliberately never looks at the owner's account, which
+-- is why discofetch-fetchpoint-lib imports tier_of and nothing more.
+M.SUSPENDED = 'this account is suspended; your names keep serving, and support can lift it'
+
+-- The columns each list serves. grant_object then drops `account_id` on the
+-- way out, because it is not news to either reader: /v1/me's list is the
+-- caller's own, and the operator asked for one account by id. (The SELECT
+-- still names it -- see "Known, carried over" in the README.)
+M.GRANT_COLS = 'id, account_id, kind, quantity, detail, source,'
+  .. ' offered_at, redeemed_at, expires_at, revoked_at, spent'
+M.INVITE_COLS = 'code, created_by, created_at, expires_at, max_uses,'
+  .. ' used_count, revoked_at, note, confers'
+M.ACCOUNT_COLS = 'id, auth0_sub, email, tier, role, created_at, last_seen_at, suspended_at'
+
+-- (3) FAN-OUT POINTS -- the registries. Every one of them exists so that
+-- adding a row is one line and a typo is a 400 rather than a row nothing
+-- will ever read.
+
+-- The published plans (www/plans.html) and this table are one decision in
+-- two places; the numbers HERE are the ones that bite. What is priced but
+-- not yet metered -- relay gigabytes -- deliberately has no field: a limit
+-- the code cannot enforce does not belong in an answer that reads as
+-- enforcement. It ships with the relay.
+-- `invites` is the advocacy dial doc/INVITES-AND-GRANTS.md names: how many
+-- LIVE codes an account may hold open at once -- not revoked, not expired,
+-- uses remaining. Free gets a couple because an invite is the reason someone
+-- passes one on; paid gets more because advocacy is what the tier is buying.
+M.TIERS = {
+  free    = { title = 'Free',    fetchpoints = 3,
+              tokens = 1,        invites = 2,
+              dns_per_hour = 120,   dns_burst = 10,
+              joins_per_min = 120,  joins_burst = 60 },
+  homelab = { title = 'Homelab', fetchpoints = 25,
+              tokens = 10,       invites = 10,
+              dns_per_hour = 720,   dns_burst = 30,
+              joins_per_min = 600,  joins_burst = 300 },
+  -- "Unlimited" as the page says it, bounded here as the number no honest
+  -- account reaches: an actual absence of a cap is how one bug fills a
+  -- disk. Raising it for a real customer is an UPDATE, not a deploy.
+  platform = { title = 'Platform', fetchpoints = 2000,
+              tokens = 100,      invites = 50,
+              dns_per_hour = 7200,  dns_burst = 120,
+              joins_per_min = 6000, joins_burst = 1200 },
+  -- The bootstrap account. Large numbers rather than an exemption,
+  -- because nothing should run unmetered -- including us.
+  system  = { title = 'System',  fetchpoints = 1000,
+              tokens = 20,       invites = 50,
+              dns_per_hour = 3600,  dns_burst = 120,
+              joins_per_min = 6000, joins_burst = 1200 },
+}
+-- 'plus' was the second tier before the plans had names. Any row still
+-- carrying it means Homelab; an alias costs one line and a rename that
+-- silently demotes a paying account costs rather more. A STATEMENT, and it
+-- must run at load: without it a plus row falls back to free and a paying
+-- account is quietly demoted by a module that merely failed to finish.
+M.TIERS.plus = M.TIERS.homelab
+
+-- The grant kinds, a registry for the same reason TIERS and ROLES are:
+--   quota_bonus  adds `quantity` to a cap. `detail.resource` says which --
+--                'fetchpoints' or 'tokens' -- and defaults to fetchpoints,
+--                which is the cap anyone means when they do not say.
+--   tier_grant   the account runs at `detail.tier` until `expires_at`.
+--   name_credit  N custom names, `spent` counting up as they are claimed.
+--                Nothing claims names yet: the column is modelled here and
+--                deliberately has no consumer, because a balance is only
+--                honest if it was counted from the day the grant was made.
+M.GRANT_KINDS     = { quota_bonus = true, tier_grant = true, name_credit = true }
+M.GRANT_RESOURCES = { fetchpoints = true, tokens = true }
+
+-- THREE ROLES, ORDERED, so every check reads "at least this much" and
+-- inserting a role between two others does not mean revisiting every
+-- handler. `audit` reads the read-only views and sees the MECHANISM rather
+-- than the CONTENTS; `admin` is the only role that will ever mutate
+-- anything, and NO ENDPOINT GRANTS IT (doc/DATA-MODEL.md 5) -- `admin` and
+-- `whoever holds the sqlite file` are one trust boundary, and the only
+-- thing keeping them one is that no session can mint the first from inside.
+M.ROLES = { user = 0, audit = 1, admin = 2 }
+
+-- QUOTA_OF LAYERS THREE WAYS, WITH THREE DIFFERENT COMBINING RULES, and
+-- they are stated here because they are decisions rather than accidents:
+--
+--   quota_bonus  is ADDITIVE          -- live bonuses sum onto the cap
+--   tier_grant   is LAST-WINS OVERRIDE -- the last live one offered decides
+--   the base tier is a DEFAULT WITH FALLBACK -- account.tier, or free
+--
+-- It reports PROVENANCE as `tier_source` ('account' or 'grant'), because an
+-- account page reading tier 'free' beside a plan of 'Homelab' is otherwise
+-- a bug report.
+--
+-- And a typo DEGRADES, NEVER OUTAGES: an unrecognised grant resource adds
+-- to nothing rather than to the wrong thing (a typo must be visible as "my
+-- bonus did nothing", never as headroom on a cap nobody granted), and an
+-- unknown tier falls back rather than taking the account out. Write time is
+-- the only moment anybody can be TOLD -- which is what validate_grant is
+-- for, and why the two must never drift apart.
+
+-- ==================================================== depth: the registries
+
+function M.tier_of(name) return M.TIERS[name] or M.TIERS.free end
+function M.role_rank(name) return M.ROLES[name] or 0 end
+
+-- ================================================== depth: the token grammar
+--
+-- Pulled out of the Authorization header, and deliberately strict: only a
+-- Bearer whose value starts with the prefix and contains nothing but the
+-- alphabet is treated as a token. Anything else -- a JWT that reached us
+-- because the gateway is misconfigured, a truncated paste -- is not a token
+-- and must not be hashed and looked up as though it might be.
+function M.opaque_token(authorization)
+  if type(authorization) ~= 'string' then return nil end
+  local v = authorization:match('^[Bb]earer%s+(.+)$')
+  if not v then return nil end
+  local body = v:match('^' .. M.TOKEN_PREFIX .. '([a-z2-7]+)$')
+  if not body then return nil end
+  return M.TOKEN_PREFIX .. body
+end
+
+-- What a token row looks like from outside. Note what is NOT here: `hash`,
+-- ever, under any circumstance. The secret appears exactly once in this
+-- program's life, in the answer to the POST that created it.
+function M.token_row(r)
+  return { id = r.id, name = r.name, prefix = r.prefix,
+           created_at = r.created_at, last_used_at = r.last_used_at,
+           expires_at = r.expires_at }
+end
+
+-- ================================================== depth: the two guards
+--
+-- Minting and revoking require a SESSION, never a token. A token that can
+-- mint tokens cannot be revoked in any meaningful sense: whoever holds it
+-- makes another one the moment the first is cut off, and the list in the
+-- panel stops being the truth about who has access. The same argument
+-- covers revocation -- a stolen token must not be able to lock the owner
+-- out by revoking theirs.
+--
+-- This is the one place below the middleware that knows how the caller
+-- arrived, and it is deliberate rather than a leak of the abstraction: the
+-- distinction being made is precisely "which credential", so it cannot be
+-- made anywhere else.
+function M.require_session(req, why)
+  if req.via == 'session' then return true end
+  return false, 403, { error = { code = 'session_required',
+                                 message = why or M.SESSION_MINT } }
+end
+
+-- The other half of that question, and it arrived with impersonation: not
+-- WHICH CREDENTIAL but WHOSE FACE. An admin acting as a customer may do
+-- everything the customer can, because reproducing a bug means being able
+-- to create the thing that breaks -- with the exceptions held back for one
+-- property rather than for squeamishness: they OUTLIVE the window.
+-- Everything else impersonation touches is undone by undoing it; a
+-- credential minted or revoked in there is not.
+function M.require_own_account(req, why)
+  if not req.impersonating then return true end
+  return false, 403, { error = { code = 'act_as_forbidden', message = why } }
+end
+
+-- WHO WAS REALLY AT THE KEYBOARD, handed to node-event-lib as its
+-- resolve_actor. Every handler passes the account it resolved, which under
+-- impersonation IS THE CUSTOMER -- so taking that row at face value would
+-- write `actor_id = account_id` and the timeline would tell the customer
+-- they did it themselves. The real caller rides on the row act_as_apply
+-- hands back (`acted_by`), and it is unwrapped in ONE place rather than at
+-- the call sites and whichever ones a later slice adds: an audit trail that
+-- depends on every caller remembering something is not an audit trail.
+--
+-- It lives here rather than in the event library because `acted_by` is this
+-- library's word; node-event-lib's own default is identity and must stay
+-- that way, which is what keeps the two from depending on each other.
+function M.resolve_actor(actor)
+  return actor and (actor.acted_by or actor) or nil
+end
+
+-- ================================================= depth: the constructor
+
+local Account = {}
+Account.__index = Account
+
+local function need(cond, what)
+  if not cond then error('accounts.new needs ' .. what, 3) end
+end
+
+function M.new(deps)
+  need(type(deps) == 'table', 'a deps table')
+  need(type(deps.db) == 'table',
+       'deps.db: the sql connector handle, with query/exec/try_exec')
+  need(type(deps.now) == 'function',
+       'deps.now: a function returning unix SECONDS (never host.time, which answers milliseconds)')
+  need(type(deps.json) == 'table' and type(deps.json.encode) == 'function'
+       and type(deps.json.decode) == 'function',
+       'deps.json: a table with encode and decode')
+  need(type(deps.ready) == 'function',
+       'deps.ready: a predicate returning ready and the connector\'s error sentence, never a captured boolean')
+  need(type(deps.crypto) == 'table' and type(deps.crypto.random) == 'function'
+       and type(deps.crypto.hash) == 'function',
+       'deps.crypto: a table with random(bytes) -> hex and hash(secret)')
+  need(type(deps.drtdb) == 'table' and type(deps.drtdb.rows_by_name) == 'function',
+       'deps.drtdb: drt-db-lib, for rows_by_name')
+  need(type(deps.model) == 'table' and type(deps.model.base32_from_hex) == 'function',
+       'deps.model: discofetch-model-lib, for base32_from_hex (the token and invite-code draws)')
+  need(type(deps.http) == 'table' and type(deps.http.int_param) == 'function',
+       'deps.http: drt-http-api-lib, for int_param')
+  need(type(deps.events) == 'table' and type(deps.events.log) == 'function'
+       and type(deps.events.last) == 'function',
+       'deps.events: a node-event-lib instance, for log and last')
+  need(type(deps.rate) == 'table' and type(deps.rate.check) == 'function',
+       'deps.rate: a token-rate-limit-lib instance, for check')
+  need(type(deps.rate.POLICIES) == 'table' and deps.rate.POLICIES.redeem ~= nil,
+       'deps.rate.POLICIES.redeem: the redeem policy off token-rate-limit-lib, not a bucket of this library\'s own')
+
+  return setmetatable({
+    db     = deps.db,
+    now    = deps.now,
+    json   = deps.json,
+    ready  = deps.ready,
+    crypto = deps.crypto,
+    drtdb  = deps.drtdb,
+    model  = deps.model,
+    http   = deps.http,
+    events = deps.events,
+    rate   = deps.rate,
+  }, Account)
+end
+
+-- The 503 every entry point owes an honest answer to. A PREDICATE call, so
+-- a library constructed before migrate() ran answers correctly afterwards.
+function Account:unavailable()
+  local ready, err = self.ready()
+  if ready then return nil end
+  return 503, { error = { code = 'db_unavailable',
+                          message = err or 'the database is not open' } }
+end
+
+-- ===================================================== depth: resolving one
+--
+-- The account a token belongs to, or nil plus the refusal.
+function Account:account_by_token(secret)
+  local t = self.now()
+  local q = self.db.query([[SELECT a.id, a.auth0_sub, a.email, a.tier, a.role,
+                              a.created_at, a.last_seen_at, k.id, k.last_used_at
+                         FROM api_token k
+                         JOIN account a ON a.id = k.account_id
+                        WHERE k.hash = ?1
+                          AND k.revoked_at IS NULL
+                          AND (k.expires_at IS NULL OR k.expires_at > ?2)
+                          AND a.suspended_at IS NULL
+                        LIMIT 1]], self.crypto.hash(secret), t)
+  local row = q.rows[1]
+  if not row then return nil, 401, M.TOKEN_INVALID end
+
+  -- Coarse, for the same reason last_seen_at is: this is a read path, and
+  -- turning every authenticated request into a write costs more than
+  -- five-minute resolution is worth. The panel shows "last used" to help
+  -- someone decide whether a token is still in use, which is a question
+  -- nobody asks to the minute.
+  local token_id, last_used = row[8], row[9]
+  if last_used == nil or last_used < t - M.SEEN_COARSE then
+    self.db.exec('UPDATE api_token SET last_used_at = ? WHERE id = ?', t, token_id)
+  end
+
+  return { id = row[1], auth0_sub = row[2], email = row[3], tier = row[4],
+           role = row[5], created_at = row[6], last_seen_at = row[7] }
+end
+
+-- Returns the account row, or nil plus a status and a payload to answer
+-- with. This is the seam doc/ROADMAP.md's Phase 4 calls "one auth
+-- middleware", and it is the only place in the program that knows who the
+-- real caller is.
+function Account:resolve_account(req)
+  local s, p = self:unavailable()
+  if s then return nil, s, p end
+
+  -- A token is the OTHER way in, and it resolves to the same account row that
+  -- a session does. Nothing below this function learns which was used, except
+  -- the two places that must: minting and revoking (see require_session).
+  --
+  -- Checked before x-df-sub only because a request carries one or the other;
+  -- the gateway strips x-df-* from anything it did not verify itself, and it
+  -- passes dfp_live_ bearers through without parsing them as JWTs.
+  local secret = M.opaque_token(req.authorization)
+  if secret then
+    local row, status, payload = self:account_by_token(secret)
+    if not row then return nil, status, payload end
+    req.via = 'token'
+    -- Through act_as_apply on this path too, and it exists here to REFUSE: a
+    -- token carrying act-as is told no rather than quietly served as its own
+    -- owner. Ignoring the header would leave a caller who believes they are
+    -- acting as a customer in fact acting as an ADMIN, which is the most
+    -- dangerous of the three possible outcomes.
+    return self:act_as_apply(req, row)
+  end
+
+  if not req.sub then
+    -- The gateway asserts x-df-sub only after verifying a token, so its
+    -- absence means "not authenticated" rather than "bad request" -- and no
+    -- account row is created for a caller nobody vouched for.
+    return nil, 401, { error = { code = 'unauthenticated',
+                                 message = 'no verified identity on this request' } }
+  end
+  req.via = 'session'
+
+  local t = self.now()
+
+  -- Registration is CLOSED. This is the lock, and it is here rather than in
+  -- Auth0 or the panel because this is the only place that can hold it: the
+  -- tenant will mint a valid token for any Google account, the gateway will
+  -- verify it honestly (that is its job), and hiding a button changes what
+  -- is convenient, not what is possible. A verified identity with no account
+  -- row is a stranger with real ID -- authenticated, and not a customer.
+  --
+  -- When registration opens, this becomes the upsert it used to be plus
+  -- whatever invitation or quota logic opening actually means. Until then,
+  -- accounts are created by the operator:
+  --
+  --   sqlite3 /var/lib/discofetch/discofetch.sqlite \
+  --     "INSERT INTO account (auth0_sub, created_at) VALUES ('<sub>', strftime('%s','now'))"
+  --
+  -- ?1/?2 rather than plain ? because the connector insists you "bind them
+  -- all or none".
+  self.db.exec('UPDATE account SET last_seen_at = ?2'
+    .. ' WHERE auth0_sub = ?1'
+    .. ' AND (last_seen_at IS NULL OR last_seen_at < ?2 - ' .. M.SEEN_COARSE .. ')',
+    req.sub, t)
+
+  -- suspended_at is READ here rather than filtered on, and that is the split
+  -- this library already argues for elsewhere: which credential arrived
+  -- changes what a refusal may say. A SESSION is a verified human, so "your
+  -- account is suspended" is a true sentence we can afford to say, and it is
+  -- far cheaper than the support ticket that 'registration is closed' generates
+  -- when a customer of six months reads it about their own account.
+  -- account_by_token keeps the opposite rule for the opposite reason: a
+  -- stolen token learns nothing.
+  --
+  -- auth0_sub rides along because impersonation's answer names both
+  -- identities (me_body), and because it is the only name an account with no
+  -- email has.
+  local q = self.db.query('SELECT ' .. M.ACCOUNT_COLS
+    .. ' FROM account WHERE auth0_sub = ? LIMIT 1', req.sub)
+  local row = q.rows[1]
+  if not row then
+    -- 403, not 401: the credential is fine and the answer is still no.
+    -- Refusing to say which -- a generic 401 -- would send a real customer
+    -- whose row was somehow lost into re-login loops instead of support.
+    return nil, 403, { error = { code = 'registration_closed',
+                                 message = 'registration is closed; this identity has no account' } }
+  end
+
+  -- Map by column name. Positional indexing works right up until someone
+  -- reorders the SELECT, and then it silently swaps two fields of the same
+  -- type -- here, two timestamps.
+  local acct = {}
+  for i, name in ipairs(q.cols) do acct[name] = row[i] end
+
+  if acct.suspended_at ~= nil then
+    return nil, 403, { error = { code = 'account_suspended', message = M.SUSPENDED } }
+  end
+
+  return self:act_as_apply(req, acct)
+end
+
+-- ============================================ depth: acting as somebody else
+--
+-- `act-as` has sat on the listener's header allowlist since the gateway
+-- landed, promising this and honouring none of it. This is the promise kept:
+-- an admin puts an account id in the header and the request runs AS that
+-- account -- same tier, same quota, same rows, same refusals -- because
+-- reproducing a customer's problem means being able to create the thing that
+-- breaks, and "can you click that for me?" is how support teaches people to
+-- hand over their credentials.
+--
+-- It resolves in exactly ONE place: here, called from the end of
+-- resolve_account, after the real caller is known. Every handler reads
+-- `acct` and sees a customer; nothing else has to remember the feature
+-- exists. That is the property being bought, and it is why the header is
+-- consulted nowhere else.
+--
+-- The refusals, IN THE ORDER THEY ARE CHECKED. Each one closes a specific
+-- way this stops being a support tool and becomes a privilege escalation:
+--
+--   * a TOKEN may never impersonate. A token is a long-lived bearer secret
+--     that can be copied out of an env file, a CI job or a shell history; a
+--     session is a human who authenticated a moment ago. Impersonation is
+--     precisely the capability that should cost a fresh authentication.
+--   * only an ADMIN may. `audit` is the read-only role, and impersonation is
+--     a write capability wearing a read's clothes -- it would hand the role
+--     we invented to show people the MECHANISM a way into the contents.
+--   * never on /v1/admin. An admin acting as a customer while using admin
+--     routes raises a question -- which identity did that mutation run
+--     under? -- that is much cheaper to refuse than to answer later.
+--   * never AS an admin. Otherwise an admin about to be demoted launders
+--     themselves through a colleague's account and acts from in there, and
+--     every guard in the admin section is worth nothing. It also makes
+--     acting as YOURSELF impossible, which is a happy consequence.
+--   * never as a SUSPENDED account. Suspension is this system refusing an
+--     identity; a staff window into it would be the one door left open.
+--   * never as a SYSTEM account. It owns the reflect canary and no IdP can
+--     mint its sub, which is the invariant the bootstrap states; act-as is
+--     the only way into an account nobody can log in to, and a deleted
+--     canary cannot be re-created because labels are never re-issued.
+--
+-- doc/DATA-MODEL.md describes this header as carrying the target's auth0_sub
+-- and as being IGNORED for callers who may not use it. Both are older than
+-- this code and neither survived contact with it: the id is what every
+-- endpoint in the admin section addresses an account by, and a silent ignore
+-- leaves a caller who believes they are acting as a customer acting as
+-- themselves -- which, for an admin, is the failure this whole slice exists
+-- to prevent. The refusals above are honest 403s like every other one here.
+function Account:act_as_apply(req, caller)
+  local want = req.act_as
+  -- The ordinary path, and it must stay indistinguishable from a program
+  -- that never heard of any of this.
+  if want == nil or want == '' then return caller end
+
+  if req.via ~= 'session' then
+    return nil, 403, { error = { code = 'act_as_session_required',
+      message = 'act-as needs a signed-in session; a token may not act as anybody' } }
+  end
+  if caller.role ~= 'admin' then
+    return nil, 403, { error = { code = 'admin_required',
+      message = 'act-as requires an admin account' } }
+  end
+  -- The whole subtree, matched without the trailing slash so that a bare
+  -- /v1/admin route added later is covered by the rule rather than by
+  -- whoever remembers to come back here.
+  if (req.path or ''):match('^/v1/admin') then
+    return nil, 403, { error = { code = 'act_as_not_here',
+      message = 'admin routes are not available while acting as somebody else; drop the act-as header' } }
+  end
+
+  -- An integer id or nothing. A header is a string from outside, a bind
+  -- takes the value it is handed, and a float is not an id -- so anything
+  -- that is not a whole positive number names no account and lands on the
+  -- same honest 404 as an id that never existed.
+  local id = tonumber(want)
+  local target
+  if id and id == math.floor(id) and id >= 1 then
+    target = self.drtdb.rows_by_name(self.db.query('SELECT ' .. M.ACCOUNT_COLS
+      .. ' FROM account WHERE id = ? LIMIT 1', id))[1]
+  end
+  if not target then
+    return nil, 404, { error = { code = 'no_such_account',
+      message = 'act-as names no account; it takes the id from GET /v1/admin/accounts' } }
+  end
+  -- Never the SYSTEM account, and this is the one refusal that is not about
+  -- a person at all. The bootstrap creates 'system|root' to own reflect --
+  -- the permanent end-to-end canary -- and its comment states the invariant
+  -- it rests on: no IdP can mint that sub, so nothing can log in as the
+  -- owner. act-as is the way into an account that never asks an IdP, and it
+  -- reaches DELETE /v1/fetchpoints/reflect; labels are never re-issued, so
+  -- the idempotent bootstrap cannot put the canary back and the loss is
+  -- permanent. Matched on the SCOPE PREFIX -- everything up to the bar --
+  -- rather than on the bootstrap's id, so a second system account is covered
+  -- by the rule the day it exists rather than by whoever remembers to come
+  -- back here.
+  if (target.auth0_sub or ''):match('^([^|]*)|') == 'system' then
+    return nil, 403, { error = { code = 'no_impersonating_system',
+      message = 'that is a system account, not a customer; it owns the reflect canary, no identity provider can sign in as it, and act-as is not the exception' } }
+  end
+  if target.suspended_at ~= nil then
+    return nil, 403, { error = { code = 'account_suspended',
+      message = 'that account is suspended; you cannot act as an identity the system itself refuses' } }
+  end
+  if target.role == 'admin' then
+    return nil, 403, { error = { code = 'no_impersonating_admins',
+      message = 'admins cannot act as other admins' } }
+  end
+
+  -- ONE ROW PER WINDOW, not one per request. The panel makes a handful of
+  -- calls per page, and the write amplification the event log refuses for dns
+  -- updates it must refuse here too: what is worth recording is that staff
+  -- looked, not how many XHRs the page happened to make. Five minutes is the
+  -- window; the cost is one indexed single-row SELECT on a path that runs
+  -- when somebody is working a support ticket, which is rare and slow anyway.
+  local recent = self.events:last('impersonate.start', target.id, caller.id)
+  if not recent or recent < self.now() - M.ACT_AS_EVENT_EVERY then
+    self.events:log('impersonate.start', target.id, caller, { address = req.real_ip })
+  end
+
+  -- The real caller is recorded TWICE, and the duplication is the point:
+  -- neither reader can see the other's copy. The guards and me_body are
+  -- handed the REQUEST and read it there; the event log is handed an account
+  -- ROW by call sites that know nothing about any of this, and reads
+  -- `acted_by` off it (M.resolve_actor). Everything else keeps reading
+  -- `acct` and correctly sees a customer.
+  req.actor = caller
+  req.impersonating = true
+  target.acted_by = caller
+  return target
+end
+
+-- ====================================================== depth: the grants
+--
+-- A grant is a gift with provenance: a tester's thank-you, a referral bonus
+-- and a paid pack are one row shape and differ only in `source`.
+--
+-- WHEN A GRANT COUNTS, spelled once. Three clauses -- accepted, not
+-- withdrawn, not run out -- and every reader needs all three: the quota
+-- arithmetic, the redeem endpoint's answer, and the `active` flag on
+-- /v1/me. Three copies of it would disagree the first time one learns
+-- something the others did not, and the copy that drifts is the one
+-- deciding what somebody paid for.
+--
+-- `t` is INTERPOLATED rather than bound, which is safe in the one direction
+-- that matters: it is always now(), an integer this program computed, never
+-- anything a caller sent. Binding it would put its parameter number at the
+-- mercy of which query the fragment is pasted into, and the readers below
+-- number their binds differently.
+function M.grant_live_sql(t)
+  return '(redeemed_at IS NOT NULL AND revoked_at IS NULL'
+    .. ' AND (expires_at IS NULL OR expires_at > ' .. t .. '))'
+end
+
+-- WHAT A GRANT MAY SAY, checked once. Two doors now offer grants -- the
+-- operator handing one over directly, and an invite's `confers` promising
+-- them to whoever redeems the code -- and both must refuse the same shapes
+-- with the same codes, because a confers entry IS a deferred call to the
+-- direct endpoint. Two copies of this validation would drift, and the copy
+-- that drifts is the one deciding what a code someone already mailed out
+-- actually confers. `source` is deliberately NOT here: it is provenance,
+-- which each door knows and the grant itself does not.
+--
+-- Returns {kind, quantity, detail, expires_at} normalised, or nil plus the
+-- payload to refuse with -- the same {error = {code, message}} shape every
+-- handler answers, so a caller wraps or returns it unchanged.
+function M.validate_grant(spec, t)
+  if type(spec) ~= 'table' then
+    return nil, { error = { code = 'invalid_grant',
+                            message = 'a grant must be a JSON object' } }
+  end
+
+  local kind = spec.kind
+  if type(kind) ~= 'string' or not M.GRANT_KINDS[kind] then
+    return nil, { error = { code = 'invalid_kind',
+        message = 'kind must be quota_bonus, tier_grant or name_credit' } }
+  end
+
+  -- A whole number, and bounded at both ends. Zero is legal in the column
+  -- and meaningless for the two countable kinds -- a bonus of nothing is a
+  -- card the panel would draw promising nothing -- so those two demand one.
+  local quantity = spec.quantity
+  if quantity == nil then quantity = 0 end
+  if type(quantity) ~= 'number' or quantity ~= math.floor(quantity)
+      or quantity < 0 or quantity > M.GRANT_QUANTITY_MAX then
+    return nil, { error = { code = 'invalid_quantity',
+        message = 'quantity must be a whole number from 0 to ' .. M.GRANT_QUANTITY_MAX } }
+  end
+  if (kind == 'quota_bonus' or kind == 'name_credit') and quantity < 1 then
+    return nil, { error = { code = 'invalid_quantity',
+        message = 'a ' .. kind .. ' of zero grants nothing; send a quantity of 1 or more' } }
+  end
+
+  local detail = spec.detail
+  if detail == nil then detail = {} end
+  if type(detail) ~= 'table' then
+    return nil, { error = { code = 'invalid_detail',
+                            message = 'detail must be a JSON object' } }
+  end
+
+  -- The two kinds whose behaviour is DECIDED by detail get their key
+  -- validated here, because quota_of degrades rather than errors: a typo'd
+  -- resource or tier there adds nothing and takes nobody out, which is the
+  -- right behaviour at read time and the wrong one at write time. This is
+  -- the only moment anybody can be told.
+  if kind == 'quota_bonus' then
+    local res = detail.resource
+    if res == nil then res = 'fetchpoints' end
+    if type(res) ~= 'string' or not M.GRANT_RESOURCES[res] then
+      return nil, { error = { code = 'invalid_resource',
+          message = 'detail.resource must be fetchpoints or tokens' } }
+    end
+    detail.resource = res
+  elseif kind == 'tier_grant' then
+    if type(detail.tier) ~= 'string' or not M.TIERS[detail.tier] then
+      return nil, { error = { code = 'invalid_grant_tier',
+          message = 'detail.tier must name a tier in the registry' } }
+    end
+  end
+
+  local expires_at = spec.expires_at
+  if expires_at ~= nil then
+    if type(expires_at) ~= 'number' or expires_at ~= math.floor(expires_at)
+        or expires_at <= t then
+      return nil, { error = { code = 'invalid_expiry',
+          message = 'expires_at must be a unix time in seconds, in the future' } }
+    end
+  end
+  -- A TIER GRANT ALWAYS EXPIRES, and visibly. That is the shape of the
+  -- product rather than a schema rule: a trial that evaporates and a
+  -- thank-you that does not are different things, and the pairing only means
+  -- something if the tier half is the one with an end on it. An operator who
+  -- means "permanently on Homelab" is describing account.tier and should
+  -- PATCH it.
+  if kind == 'tier_grant' and expires_at == nil then
+    return nil, { error = { code = 'expiry_required',
+        message = 'a tier_grant runs until a date and the date is shown to '
+          .. 'the account holder from the moment they accept; send expires_at, '
+          .. 'or change their tier if it is meant to be permanent' } }
+  end
+
+  return { kind = kind, quantity = quantity, detail = detail,
+           expires_at = expires_at }
+end
+
+-- The OFFER, written. One insert for both doors, for the reason the
+-- validator above is one function -- and it writes an offer and nothing
+-- else: redeemed_at and revoked_at are simply absent, their default the
+-- NULL that says neither has happened. An invite's confers land through
+-- here too, as offers, because the panel's card is the moment the person
+-- is handed the gift and a grant redeemed by machinery robs them of it.
+--
+-- expires_at is NULLABLE and the connector refuses a nil bind outright, so
+-- the column joins the statement ONLY WHEN THERE IS A VALUE -- the same
+-- construction the event log uses for its three optional columns.
+function Account:grant_insert(account_id, g, source, t)
+  local cols  = { 'account_id', 'kind', 'quantity', 'detail', 'source', 'offered_at' }
+  local binds = { account_id, g.kind, g.quantity, self.json.encode(g.detail or {}),
+                  source, t }
+  if g.expires_at then
+    cols[#cols + 1]  = 'expires_at'
+    binds[#binds + 1] = g.expires_at
+  end
+  local marks = {}
+  for i = 1, #binds do marks[i] = '?' .. i end
+  return self.db.exec('INSERT INTO account_grant (' .. table.concat(cols, ', ')
+    .. ') VALUES (' .. table.concat(marks, ', ') .. ')', table.unpack(binds)).rowid
+end
+
+-- `detail` is DECODED rather than passed through as a string -- a client
+-- reads a field instead of parsing JSON out of JSON.
+--
+-- `active` comes off the SQL fragment rather than being recomputed here,
+-- which is the whole point of having one fragment: the flag the panel draws
+-- a card from and the arithmetic the cap is built from can never disagree
+-- about whether a gift is in force.
+--
+-- A missing timestamp is spelled by the key's ABSENCE, which is what a
+-- nullable column has always looked like in this API (the event log leaves
+-- the column out of the statement rather than binding nil), so no client
+-- learns a second spelling for "not yet".
+function Account:grant_object(r)
+  local detail = {}
+  if type(r.detail) == 'string' then
+    local okd, d = pcall(self.json.decode, r.detail)
+    if okd and type(d) == 'table' then detail = d end
+  end
+  return {
+    id          = r.id,
+    kind        = r.kind,
+    quantity    = r.quantity,
+    spent       = r.spent,
+    detail      = detail,
+    source      = r.source,
+    offered_at  = r.offered_at,
+    redeemed_at = r.redeemed_at,
+    expires_at  = r.expires_at,
+    revoked_at  = r.revoked_at,
+    active      = r.active == 1,
+  }
+end
+
+-- One grant, whole, with the live flag computed by the database. Both the
+-- redeem endpoint and the operator's create read their answer back through
+-- here rather than assembling one from what they just wrote: a response that
+-- describes the row is a response that cannot claim a redemption the UPDATE
+-- did not make.
+function Account:grant_by_id(id, t)
+  return self.drtdb.rows_by_name(self.db.query('SELECT ' .. M.GRANT_COLS .. ', '
+    .. M.grant_live_sql(t) .. ' AS active FROM account_grant WHERE id = ? LIMIT 1',
+    id))[1]
+end
+
+-- The account's grants, newest first. OFFERED AND REDEEMED BOTH, and revoked
+-- and lapsed ones too: every row carries `active`, `redeemed_at` and
+-- `revoked_at`, so the panel decides what is a card and what is history --
+-- and a gift that was withdrawn disappearing from the list entirely is the
+-- one thing that guarantees a support conversation.
+function Account:grants_of(account_id, t)
+  return self.drtdb.rows_by_name(self.db.query('SELECT ' .. M.GRANT_COLS .. ', '
+    .. M.grant_live_sql(t) .. ' AS active FROM account_grant'
+    .. ' WHERE account_id = ? ORDER BY id DESC LIMIT ' .. M.ACCOUNT_GRANTS,
+    account_id))
+end
+
+-- What the tier allows, and what the account holds against it. Its own
+-- function because there are two readers: the customer's own /v1/me, and the
+-- operator's account detail -- which exists to answer "why is their create
+-- failing" and can only answer it with the arithmetic the create itself
+-- does. Two copies of a tier calculation drift, and the copy that drifts is
+-- the one being read aloud on a support call. The create gates read it too,
+-- for that reason: NOTHING ELSE IN THIS PROGRAM COMPUTES A CAP.
+--
+-- used counts LIVE rows only, matching the list and the create gate, so
+-- deleting one visibly returns headroom. Tokens the same way: a revoked row
+-- is history, and counting it would mean revoking never returns headroom.
+--
+-- The answer carries `base` and `bonus` beside `limit` because "25 of 25"
+-- with no explanation is how a support ticket starts -- and because the day
+-- someone disputes their cap, the number and its two halves have to come out
+-- of the same call rather than out of a reconstruction.
+--
+-- ONE query for every grant on the account, not one per grant: this runs on
+-- the create path, and the per-resource split lives inside a JSON column, so
+-- the summing is done here rather than by a GROUP BY that cannot see into
+-- `detail`. (The three combining rules are in the surface block.)
+function Account:quota_of(acct)
+  local t = self.now()
+  local used = self.db.query([[SELECT COUNT(*) FROM fetchpoint
+                           WHERE owner_account_id = ? AND deleted_at IS NULL]],
+                        acct.id).rows[1][1]
+  local tokens = self.db.query([[SELECT COUNT(*) FROM api_token
+                             WHERE account_id = ? AND revoked_at IS NULL]],
+                          acct.id).rows[1][1]
+
+  -- Positional rather than rows_by_name: the column order is right here,
+  -- three columns long.
+  local granted_tier, bonus = nil, { fetchpoints = 0, tokens = 0 }
+  local gq = self.db.query('SELECT kind, quantity, detail FROM account_grant'
+    .. ' WHERE account_id = ? AND ' .. M.grant_live_sql(t)
+    .. ' ORDER BY id LIMIT ' .. M.QUOTA_GRANT_ROWS, acct.id)
+  for _, r in ipairs(gq.rows) do
+    local kind, quantity, raw = r[1], r[2], r[3]
+    local detail = {}
+    if type(raw) == 'string' then
+      local okd, d = pcall(self.json.decode, raw)
+      if okd and type(d) == 'table' then detail = d end
+    end
+    if kind == 'quota_bonus' then
+      -- fetchpoints is what a bonus means when it does not say, and an
+      -- unrecognised resource adds to nothing rather than to the wrong
+      -- thing: a typo must be visible as "my bonus did nothing", never as
+      -- headroom on a cap nobody granted.
+      local res = detail.resource
+      if res == nil then res = 'fetchpoints' end
+      if M.GRANT_RESOURCES[res] and type(quantity) == 'number' and quantity > 0 then
+        bonus[res] = bonus[res] + quantity
+      end
+    elseif kind == 'tier_grant' then
+      -- Last one offered wins, and an unknown tier is ignored for the same
+      -- reason tier_of falls back rather than erroring: a typo'd tier must
+      -- degrade to the account's own, never take the account out.
+      if type(detail.tier) == 'string' and M.TIERS[detail.tier] then
+        granted_tier = detail.tier
+      end
+    end
+  end
+
+  -- The effective tier, which is the granted one when there is one. `tier`
+  -- has always been the name the caps below were computed from, so it keeps
+  -- meaning that -- and `tier_source` says which column it came out of,
+  -- because an account page reading tier 'free' beside a plan of 'Homelab'
+  -- is otherwise a bug report.
+  local tier = M.TIERS[acct.tier] and acct.tier or 'free'
+  local source = 'account'
+  if granted_tier then tier, source = granted_tier, 'grant' end
+  local lim = M.tier_of(tier)
+
+  return {
+    tier                  = tier,
+    tier_source           = source,
+    plan                  = lim.title,
+    fetchpoints           = { used = used, base = lim.fetchpoints,
+                              bonus = bonus.fetchpoints,
+                              limit = lim.fetchpoints + bonus.fetchpoints },
+    tokens                = { used = tokens, base = lim.tokens,
+                              bonus = bonus.tokens,
+                              limit = lim.tokens + bonus.tokens },
+    dns_updates_per_hour  = lim.dns_per_hour,
+    room_joins_per_minute = lim.joins_per_min,
+  }
+end
+
+-- ======================================================= depth: /v1/me
+--
+-- ASSEMBLED BY HAND, since grants landed. json.encode cannot spell an empty
+-- ARRAY -- a Lua table with no entries has no shape to read -- and "no
+-- grants" is not an edge case here, it is what every account answers until
+-- somebody is given something. A panel that branches on `{}` versus `[]` on
+-- the page it loads first is a panel that breaks for everyone but testers.
+--
+-- The body WITHOUT the resolution, because /v1/me now has two callers with
+-- two different ways of knowing who is asking: me_get resolves the caller
+-- like every other handler, and POST /v1/redeem CANNOT -- it serves the one
+-- caller resolve_account exists to refuse, and hands the account row in
+-- itself. Splitting shape from resolution is what lets the redeem answer BE
+-- /v1/me's answer rather than a copy of it that drifts.
+function Account:me_body(req, acct)
+  local out = { account = {
+    email        = acct.email,
+    tier         = acct.tier,
+    -- The admin flag, per doc/PANEL-PLAN.md 6: `role === "admin"` is what
+    -- reveals the panel's Admin view. It is a fact about the caller's own
+    -- account, and telling someone they are an admin tells them nothing
+    -- they could not learn by trying.
+    role         = acct.role,
+    created_at   = acct.created_at,
+    last_seen_at = acct.last_seen_at,
+  } }
+  local t = self.now()
+  out.quota = self:quota_of(acct)
+
+  -- THE CONFESSION, and it is the only new key in this answer: when the
+  -- account above is somebody else's, this says so -- who is really asking,
+  -- with what rank, and whose account they are wearing. Nothing leaks, because
+  -- the reader IS the admin who asked for the window. The panel's banner is
+  -- only ever as trustworthy as this field: an admin who forgets which face
+  -- they have on and deletes the wrong thing is THE failure mode of the whole
+  -- feature, and an API that answers honestly on every page load is the only
+  -- thing a banner can be built on.
+  if req.impersonating and req.actor then
+    out.impersonation = {
+      actor      = req.actor.auth0_sub,
+      actor_role = req.actor.role,
+      subject    = acct.auth0_sub,
+      subject_id = acct.id,
+    }
+  end
+
+  -- The caller's own gifts, offered and redeemed. Under a window these are
+  -- the SUBJECT's, like everything else on this page -- an admin acting as a
+  -- customer sees what the customer sees, which is the whole bargain of the
+  -- feature; what they may not do is accept one (see grants_redeem).
+  local gparts = {}
+  for i, r in ipairs(self:grants_of(acct.id, t)) do
+    gparts[i] = self.json.encode(self:grant_object(r))
+  end
+
+  local body = self.json.encode(out)
+  -- Spliced in rather than encoded with the rest, because the rest of this
+  -- answer is a table and this one key must be an ARRAY even when empty.
+  -- The object always has at least `account`, so there is always a closing
+  -- brace with something before it.
+  return 200, body:sub(1, #body - 1)
+    .. ',"grants":[' .. table.concat(gparts, ',') .. ']}'
+end
+
+function Account:me_get(req, p)
+  local acct, status, payload = self:resolve_account(req)
+  if not acct then return status, payload end
+  return self:me_body(req, acct)
+end
+
+-- A SESSION, never a token: a credential that can change where the
+-- account's mail goes is a password-reset vector, and a stolen token must
+-- not be able to point the recovery address at whoever stole it.
+function Account:me_patch(req, p)
+  local acct, status, payload = self:resolve_account(req)
+  if not acct then return status, payload end
+  local okay, s, pl = M.require_session(req)
+  if not okay then return s, pl end
+  -- Not while wearing somebody else's face. Setting a customer's contact
+  -- address for them is not support, and a self-asserted email is exactly the
+  -- field an attacker holding a staff account would reach for -- it is the one
+  -- this program will one day send a recovery link to. The check sits here,
+  -- after resolve_account (which is where impersonation becomes known) and
+  -- before the body is read, because the refusal is about who is asking and
+  -- not about what they sent.
+  local mine, ms, mpl = M.require_own_account(req, M.ME_PATCH_ACT_AS)
+  if not mine then return ms, mpl end
+
+  local body = {}
+  if req.body and req.body ~= '' then
+    local ok, decoded = pcall(self.json.decode, req.body)
+    if not ok or type(decoded) ~= 'table' then
+      return 400, { error = { code = 'malformed_body',
+                              message = 'the body is not a JSON object' } }
+    end
+    body = decoded
+  end
+
+  -- Unknown keys refused BY NAME, and a body carrying none of the ones this
+  -- handler knows refused outright -- the same contract fetchpoints_update
+  -- states, and the same `immutable_field` refusal naming the offending key,
+  -- because two PATCH handlers in one program disagreeing about what an
+  -- unrecognised body means is a defect by itself. Here it was a destructive
+  -- one. `email` is the only key, so {"emial": ...}, {} and no body at all
+  -- were all indistinguishable from "clear it" and answered 200 having
+  -- dropped the address on the floor -- and this handler is the only writer
+  -- the column has, so nothing in the program could put it back.
+  for k in pairs(body) do
+    if k ~= 'email' then
+      return 400, { error = { code = 'immutable_field',
+                              message = 'no PATCHable field named ' .. tostring(k) } }
+    end
+  end
+
+  -- json.decode answers a JSON null as nil, so {"email": null} and a body
+  -- with no email key arrive here IDENTICALLY -- there is no reading of the
+  -- decoded table that can tell "set it to nothing" from "I did not mention
+  -- it". So the empty string is the spelling of "clear it", it is the one a
+  -- panel form sends anyway, and everything else is a 400 rather than a
+  -- guess at which of the two a caller meant.
+  local email = body.email
+  if email == nil then
+    return 400, { error = { code = 'nothing_to_change',
+                            message = 'send email, or "" to clear it' } }
+  end
+  if type(email) ~= 'string' then
+    return 400, { error = { code = 'invalid_email',
+                            message = 'that does not look like an email address' } }
+  end
+  email = email:match('^%s*(.-)%s*$'):lower()
+
+  -- What the row held BEFORE the write, so the event below can describe what
+  -- happened rather than what was asked for.
+  local was = acct.email
+
+  if email == '' then
+    -- Clearing gets its OWN statement, with the NULL written into the text.
+    -- The connector refuses a nil bind -- "SQL NULL is spelled NULL in the
+    -- statement text" -- so there is no one statement with an optional
+    -- parameter to be had here.
+    self.db.exec('UPDATE account SET email = NULL WHERE id = ?', acct.id)
+  else
+    -- Deliberately the SAME loose rule waitlist_join applies, not a second
+    -- opinion about what an address looks like: two notions of validity in
+    -- one program is how an address that was good enough to join the
+    -- waitlist turns out not to be good enough to save on the account it
+    -- was let in for.
+    if #email < M.EMAIL_MIN or #email > M.EMAIL_MAX
+        or not email:match('^[^@%s]+@[^@%s]+%.[^@%s]+$') then
+      return 400, { error = { code = 'invalid_email',
+                              message = 'that does not look like an email address' } }
+    end
+    self.db.exec('UPDATE account SET email = ?1 WHERE id = ?2', email, acct.id)
+  end
+
+  -- THREE OUTCOMES, and only two of them are events. One unconditional
+  -- 'account.email.set' made setting an address, removing one and changing
+  -- nothing write byte-identical rows -- a timeline that says the same thing
+  -- about three different things has stopped being evidence, which is the
+  -- only reason this table is durable. So: the kind names which way the
+  -- column moved, and a PATCH that moved it nowhere is silence.
+  if email == '' then
+    if was ~= nil then
+      self.events:log('account.email.clear', acct.id, acct,
+                { address = req.real_ip, detail = { source = 'self' } })
+    end
+  elseif email ~= was then
+    self.events:log('account.email.set', acct.id, acct,
+              { address = req.real_ip, detail = { source = 'self' } })
+  end
+
+  -- The answer is GET /v1/me's, from GET /v1/me rather than from a copy of
+  -- it: a PATCH whose response drifts from the GET is a panel bug waiting
+  -- for the first field only one of them knows about.
+  return self:me_get(req, p)
+end
+
+-- ================================================= depth: the token routes
+
+function Account:tokens_list(req, p)
+  local acct, status, payload = self:resolve_account(req)
+  if not acct then return status, payload end
+  local q = self.db.query([[SELECT id, name, prefix, created_at, last_used_at, expires_at
+                         FROM api_token
+                        WHERE account_id = ? AND revoked_at IS NULL
+                        ORDER BY created_at DESC LIMIT ]] .. M.TOKEN_LIST, acct.id)
+  local out = {}
+  for _, r in ipairs(self.drtdb.rows_by_name(q)) do out[#out + 1] = M.token_row(r) end
+  -- The empty ARRAY, spelled as text for the reason me_body splices its own.
+  if #out == 0 then return 200, '{"tokens":[]}' end
+  return 200, { tokens = out }
+end
+
+function Account:tokens_create(req, p)
+  local acct, status, payload = self:resolve_account(req)
+  if not acct then return status, payload end
+  local okay, s, pl = M.require_session(req)
+  if not okay then return s, pl end
+  -- The one thing a support window may not do (doc/DATA-MODEL.md puts it
+  -- best: a window that can cut its own key is a key). It sits AFTER
+  -- resolve_account because that is the call that discovers there is a window
+  -- at all -- checking any earlier would refuse nobody.
+  local mine, ms, mpl = M.require_own_account(req, M.TOKEN_ACT_AS_MINT)
+  if not mine then return ms, mpl end
+
+  -- The token cap, counted over LIVE rows so revoking one returns headroom.
+  -- Free gets exactly one on purpose: the API is half of what this product
+  -- IS, and a free tier that cannot curl cannot fall for it.
+  --
+  -- Through quota_of rather than off TIERS directly, because the cap is no
+  -- longer a property of the tier alone: a redeemed quota_bonus adds to it,
+  -- and a gate that read the registry would hand somebody a bonus the panel
+  -- shows them and the create refuses to honour. One helper computes a cap.
+  local q = self:quota_of(acct)
+  if q.tokens.used >= q.tokens.limit then
+    return 403, { error = { code = 'quota_exceeded',
+        message = 'the ' .. q.tier .. ' tier holds ' .. q.tokens.limit
+          .. ' API token' .. (q.tokens.limit == 1 and '' or 's')
+          .. ' and this account has ' .. q.tokens.used
+          .. '; revoke one, or ask about a bigger tier' } }
+  end
+
+  local body = {}
+  if req.body and req.body ~= '' then
+    local ok, decoded = pcall(self.json.decode, req.body)
+    if not ok or type(decoded) ~= 'table' then
+      return 400, { error = { code = 'malformed_body',
+                              message = 'the body is not a JSON object' } }
+    end
+    body = decoded
+  end
+
+  -- A name is optional here where it is required on a fetchpoint: an unnamed
+  -- token is still usable, and forcing a label on "the one I just made to try
+  -- curl" earns nothing.
+  local name = body.name
+  if name == nil then name = '' end
+  if type(name) ~= 'string' or #name > M.TOKEN_NAME_MAX then
+    return 400, { error = { code = 'invalid_name',
+                            message = 'name must be a string of ' .. M.TOKEN_NAME_MAX
+                              .. ' characters or fewer' } }
+  end
+
+  local secret = M.TOKEN_PREFIX
+    .. self.model.base32_from_hex(self.crypto.random(M.TOKEN_BYTES))
+  local t = self.now()
+  -- The stored prefix carries the first four symbols of the BODY, not just
+  -- the constant: migration 3 promised "which token a row refers to", and
+  -- a column that says dfp_live_ for every row answers "is it one of ours"
+  -- while failing the question it exists for. Four symbols is 20 bits --
+  -- enough to tell ten tokens apart, nothing anyone can extend to a secret.
+  local prefix = secret:sub(1, #M.TOKEN_PREFIX + 4)
+  -- A plain INSERT, so exec's rowid IS this row's id -- unlike the account
+  -- upsert, where the DO UPDATE path leaves it stale.
+  local r = self.db.exec([[INSERT INTO api_token (account_id, name, prefix, hash, created_at)
+                      VALUES (?, ?, ?, ?, ?)]],
+                    acct.id, name, prefix, self.crypto.hash(secret), t)
+
+  -- `prefix` and never `secret`. The prefix is the whole point of the
+  -- column -- it says WHICH token without being usable as one -- and it is
+  -- what lets a timeline entry be matched against a row in the panel's list.
+  -- The secret leaves this program exactly once, in the line below.
+  self.events:log('token.create', acct.id, acct, {
+    address = req.real_ip, detail = { name = name, prefix = prefix },
+  })
+
+  -- The ONLY time the secret is ever returned. There is no endpoint that can
+  -- show it again and no column it could be read from, which is the property
+  -- that makes "shown once" true rather than merely a convention of the panel.
+  -- The id travels with it so the panel can offer "revoke" on the row it just
+  -- showed without re-listing to find out what it made.
+  return 201, { token = { id = r.rowid, name = name, prefix = prefix,
+                          created_at = t, secret = secret },
+                warning = 'this is the only time this token is shown' }
+end
+
+function Account:tokens_delete(req, p)
+  local acct, status, payload = self:resolve_account(req)
+  if not acct then return status, payload end
+  local okay, s, pl = M.require_session(req)
+  if not okay then return s, pl end
+  -- The other half of the same rule: revoking is minting run backwards, and
+  -- an admin who can cut a customer's credential off while wearing their face
+  -- can lock them out of their own API and leave the customer looking at a
+  -- list that says they did it. Listing tokens stays open -- prefixes and
+  -- hashes are not a credential -- so support can still see WHICH one.
+  local mine, ms, mpl = M.require_own_account(req, M.TOKEN_ACT_AS_REVOKE)
+  if not mine then return ms, mpl end
+
+  local id = tonumber(p and p.token_id or '')
+  if not id then
+    return 404, { error = { code = 'not_found', message = 'no such token' } }
+  end
+
+  -- account_id in the WHERE is the authorization: another account's token id
+  -- matches nothing, so it 404s exactly as an id that never existed does.
+  -- Revoked rather than deleted, because the row is the record that the
+  -- credential existed -- and `hash` is UNIQUE, so keeping it also means the
+  -- same secret can never be reissued.
+  local r = self.db.exec([[UPDATE api_token SET revoked_at = ?
+                       WHERE id = ? AND account_id = ? AND revoked_at IS NULL]],
+                    self.now(), id, acct.id)
+  if (r.changes or 0) == 0 then
+    return 404, { error = { code = 'not_found', message = 'no such token' } }
+  end
+
+  -- The name is read back rather than carried in, because revocation is
+  -- addressed by id and nothing above needed it. One extra single-row query
+  -- on a path that runs a handful of times in an account's life is a fair
+  -- price for a timeline entry that says which token went away.
+  local nm = self.db.query('SELECT name FROM api_token WHERE id = ?1 AND account_id = ?2 LIMIT 1',
+                      id, acct.id).rows[1]
+  self.events:log('token.revoke', acct.id, acct, {
+    address = req.real_ip, detail = { name = nm and nm[1] or '' },
+  })
+
+  return 200, { revoked = true, id = id }
+end
+
+-- ================================================ depth: accepting a grant
+--
+-- The customer's half of the grants feature: /v1/me shows what they were
+-- given, and this is the button. Nothing else in the API moves a grant from
+-- offered to redeemed -- the operator OFFERS and the person ACCEPTS, and
+-- keeping those two verbs in two handlers is what makes "they accepted on
+-- the 14th" a fact rather than an inference.
+function Account:grants_redeem(req, p)
+  local acct, status, payload = self:resolve_account(req)
+  if not acct then return status, payload end
+  local okay, s, pl = M.require_session(req, M.GRANT_SESSION)
+  if not okay then return s, pl end
+  local mine, ms, mpl = M.require_own_account(req, M.GRANT_ACT_AS)
+  if not mine then return ms, mpl end
+
+  local t = self.now()
+  local id = self.http.int_param(p and p.grant_id or '')
+  local row
+  if id and id >= 1 then
+    -- account_id in the WHERE is the AUTHORIZATION, exactly as it is on the
+    -- token routes: somebody else's grant id matches nothing here and 404s
+    -- like an id that never existed. A 403 would confirm the row is real,
+    -- and this endpoint would become an existence oracle for other people's
+    -- gifts -- "id 41 is somebody's, id 42 is nobody's" is a fact about a
+    -- stranger that a caller has no business assembling.
+    row = self.drtdb.rows_by_name(self.db.query('SELECT ' .. M.GRANT_COLS .. ', '
+      .. M.grant_live_sql(t) .. [[ AS active FROM account_grant
+         WHERE id = ?1 AND account_id = ?2 LIMIT 1]], id, acct.id))[1]
+  end
+  if not row then
+    return 404, { error = { code = 'not_found', message = 'no such grant' } }
+  end
+
+  -- The two refusals come BEFORE the idempotent path, and they are separate
+  -- codes rather than one 'grant_unavailable': "it was taken back" and "you
+  -- were too late" are different conversations to have with somebody who was
+  -- promised something, and a panel that can tell them apart can say which.
+  if row.revoked_at then
+    return 409, { error = { code = 'grant_revoked',
+        message = 'this grant was withdrawn and cannot be accepted' } }
+  end
+  if row.expires_at and row.expires_at <= t then
+    return 409, { error = { code = 'grant_expired',
+        message = 'this grant expired and cannot be accepted' } }
+  end
+
+  -- IDEMPOTENT, and the condition in the UPDATE is what makes it so rather
+  -- than the read above it: there are no transactions, so two clicks in the
+  -- same instant both pass the read and only one may write. `redeemed_at IS
+  -- NULL` lets the database decide which, and `changes` says whether this
+  -- request was the one that did it -- which is exactly the question the
+  -- event depends on. Answer 200 either way: the grant IS redeemed, which is
+  -- what the caller asked for, and a second click is not an error.
+  local r = self.db.exec([[UPDATE account_grant SET redeemed_at = ?1
+                       WHERE id = ?2 AND redeemed_at IS NULL]], t, row.id)
+  local first = (r and r.changes or 0) > 0
+
+  -- Read back rather than patched in memory, so the answer describes the row
+  -- as it now stands -- including the redeemed_at written by whoever won the
+  -- race above, which is what makes the second call's body the same as the
+  -- first's rather than merely similar.
+  local after = self:grant_by_id(row.id, t) or row
+
+  if first then
+    -- No secret here and nothing that names a person: kind, quantity and
+    -- provenance are the mechanism, and this row is read back by the account
+    -- holder and by anyone with an audit account.
+    self.events:log('grant.redeem', acct.id, acct, {
+      address = req.real_ip,
+      detail = { kind = after.kind, quantity = after.quantity,
+                 source = after.source },
+    })
+  end
+
+  -- The new cap travels with the answer, because that is the question the
+  -- click was really asking: a bonus that says "accepted" while the panel
+  -- still shows the old limit is indistinguishable from one that did not
+  -- work. quota_of is the same helper /v1/me reads, so the two agree.
+  return 200, { grant = self:grant_object(after), quota = self:quota_of(acct) }
+end
+
+-- ====================================================== depth: the invites
+--
+-- The prelaunch door, and the advocacy engine: an account holder mints a
+-- code, hands it to a friend, and the friend's verified-but-refused identity
+-- becomes an account by presenting it (redeem_post, below, which is the one
+-- handler here that serves the caller resolve_account refuses).
+
+-- The first eight characters -- dfi_ plus four symbols, 20 bits -- and the
+-- ONLY spelling of a code that may reach the event table or a grant's
+-- `source`. Events are read back by audit accounts and by subjects who are
+-- not the code's holder (the advocate's invite.redeem), and a full code in
+-- either place is an entry ticket handed to an audience it was never meant
+-- for. Same arithmetic as a token's stored prefix: enough to say WHICH,
+-- nothing anyone can extend to the thing itself.
+function M.invite_prefix(code) return code:sub(1, #M.INVITE_PREFIX + 4) end
+
+-- WHEN A CODE COUNTS, spelled once: not revoked, not expired, uses left.
+-- The mint cap counts these and the list serves the parts, and the same
+-- three clauses decide (inverted) what redeem_post refuses -- one definition
+-- keeps "you are holding 2 live codes" and "this code works" the same fact.
+-- `t` is interpolated on grant_live_sql's argument: always now(), never a
+-- caller's value.
+function M.invite_live_sql(t)
+  return '(revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ' .. t
+    .. ') AND used_count < max_uses)'
+end
+
+-- note / max_uses / expires_at, validated the same way for both mint doors:
+-- the admin endpoint is the user endpoint plus confers and bulk, and two
+-- opinions about what a max_uses may be is how a panel form works on one
+-- door and 400s on the other.
+function M.validate_invite_fields(body, t)
+  local note = body.note
+  if note == nil then note = '' end
+  if type(note) ~= 'string' or #note > M.NOTE_MAX then
+    return nil, { error = { code = 'invalid_note',
+        message = 'note must be a string of ' .. M.NOTE_MAX
+          .. ' characters or fewer' } }
+  end
+  local max_uses = body.max_uses
+  if max_uses == nil then max_uses = 1 end
+  if type(max_uses) ~= 'number' or max_uses ~= math.floor(max_uses)
+      or max_uses < 1 or max_uses > M.INVITE_MAX_USES then
+    return nil, { error = { code = 'invalid_max_uses',
+        message = 'max_uses must be a whole number from 1 to ' .. M.INVITE_MAX_USES } }
+  end
+  local expires_at = body.expires_at
+  if expires_at ~= nil then
+    if type(expires_at) ~= 'number' or expires_at ~= math.floor(expires_at)
+        or expires_at <= t then
+      return nil, { error = { code = 'invalid_expiry',
+          message = 'expires_at must be a unix time in seconds, in the future' } }
+    end
+  end
+  return { note = note, max_uses = max_uses, expires_at = expires_at }
+end
+
+-- One code as the API serves it, hand-assembled because `confers` must be
+-- an ARRAY even when empty -- and for every code an account holder mints it
+-- IS empty, which makes `{}` here not an edge case but the shape the panel
+-- meets first. Absent timestamps are spelled by the key's absence, as
+-- everywhere else.
+function Account:invite_json(r)
+  local o = { code = r.code, note = r.note, created_at = r.created_at,
+              max_uses = r.max_uses, used_count = r.used_count,
+              uses_remaining = math.max(0, r.max_uses - r.used_count),
+              expires_at = r.expires_at, revoked_at = r.revoked_at }
+  local parts = {}
+  if type(r.confers) == 'string' then
+    local okc, arr = pcall(self.json.decode, r.confers)
+    if okc and type(arr) == 'table' then
+      for i, e in ipairs(arr) do parts[i] = self.json.encode(e) end
+    end
+  end
+  local body = self.json.encode(o)
+  return body:sub(1, #body - 1) .. ',"confers":[' .. table.concat(parts, ',') .. ']}'
+end
+
+-- Draw, insert, and let the PRIMARY KEY refuse a duplicate -- claim_label's
+-- loop, for claim_label's reason: never SELECT then INSERT without a
+-- transaction to stand on. created_by and expires_at are NULLABLE and a nil
+-- bind is refused outright, so both join the statement only when present --
+-- and a NULL created_by is not a gap, it is the spec's spelling of "minted
+-- by the operator": ownerless on purpose, counted against nobody's cap,
+-- and invite.redeem falls back to the redeemer for its subject.
+function Account:invite_insert(created_by, f, confers_json, t)
+  for _ = 1, M.MINT_ATTEMPTS do
+    local code = M.INVITE_PREFIX
+      .. self.model.base32_from_hex(self.crypto.random(M.INVITE_BYTES))
+    local cols  = { 'code', 'created_at', 'max_uses', 'note', 'confers' }
+    local binds = { code, t, f.max_uses, f.note, confers_json }
+    if created_by then
+      cols[#cols + 1]  = 'created_by'
+      binds[#binds + 1] = created_by
+    end
+    if f.expires_at then
+      cols[#cols + 1]  = 'expires_at'
+      binds[#binds + 1] = f.expires_at
+    end
+    local marks = {}
+    for i = 1, #binds do marks[i] = '?' .. i end
+    local r = self.db.try_exec('INSERT INTO invite (' .. table.concat(cols, ', ')
+      .. ') VALUES (' .. table.concat(marks, ', ') .. ')', table.unpack(binds))
+    if r then return code end
+  end
+  return nil, 'could not claim an invite code in ' .. M.MINT_ATTEMPTS .. ' attempts'
+end
+
+-- The caller's own codes, newest first. Session or token: a list of codes
+-- is what the panel and a script both want, and reading them back is the
+-- whole point of not hashing them -- the holder has to be able to copy one
+-- out to send it. `live` and `limit` travel with the list so "2 of 2" is a
+-- fact the panel reads rather than arithmetic it repeats.
+function Account:invites_list(req, p)
+  local acct, status, payload = self:resolve_account(req)
+  if not acct then return status, payload end
+  local t = self.now()
+  local rows = self.drtdb.rows_by_name(self.db.query('SELECT ' .. M.INVITE_COLS
+    .. ' FROM invite WHERE created_by = ?'
+    .. ' ORDER BY created_at DESC LIMIT ' .. M.INVITE_LIST, acct.id))
+  local live = self.db.query('SELECT COUNT(*) FROM invite WHERE created_by = ? AND '
+    .. M.invite_live_sql(t), acct.id).rows[1][1]
+  local parts = {}
+  for i, r in ipairs(rows) do parts[i] = self:invite_json(r) end
+  return 200, '{"invites":[' .. table.concat(parts, ',')
+    .. '],"live":' .. live
+    .. ',"limit":' .. M.tier_of(self:quota_of(acct).tier).invites .. '}'
+end
+
+-- Mint one. SESSION ONLY, and never through a window -- the same pair of
+-- rules as the token routes, for the same property: what this creates
+-- outlives both the credential check and the window.
+--
+-- `confers` is refused BY NAME rather than ignored: an account holder's
+-- invite confers nothing extra -- it opens the door, and the door is the
+-- gift. Silently dropping the key would mint a code its holder believes is
+-- carrying a bonus, which is a promise this program let them make and then
+-- broke.
+function Account:invites_create(req, p)
+  local acct, status, payload = self:resolve_account(req)
+  if not acct then return status, payload end
+  local okay, s, pl = M.require_session(req, M.INVITE_SESSION)
+  if not okay then return s, pl end
+  local mine, ms, mpl = M.require_own_account(req, M.INVITE_ACT_AS)
+  if not mine then return ms, mpl end
+
+  local body = {}
+  if req.body and req.body ~= '' then
+    local ok, decoded = pcall(self.json.decode, req.body)
+    if not ok or type(decoded) ~= 'table' then
+      return 400, { error = { code = 'malformed_body',
+                              message = 'the body is not a JSON object' } }
+    end
+    body = decoded
+  end
+
+  if body.confers ~= nil then
+    return 400, { error = { code = 'confers_not_here',
+        message = 'an account holder\'s invite confers nothing extra; it '
+          .. 'opens the door, and that is the gift. Only POST /v1/admin/invites '
+          .. 'sets confers' } }
+  end
+
+  local t = self.now()
+  local f, ferr = M.validate_invite_fields(body, t)
+  if not f then return 400, ferr end
+
+  -- THE ADVOCACY DIAL. Live codes only -- revoked, lapsed and spent ones
+  -- return headroom -- against the EFFECTIVE tier's number, through quota_of
+  -- for the reason the create gates go through it: a tester running on a
+  -- granted Homelab gets Homelab's invites, and a cap read off the account
+  -- column would hand them the panel's number and refuse them here.
+  local cap = M.tier_of(self:quota_of(acct).tier).invites
+  local live = self.db.query('SELECT COUNT(*) FROM invite WHERE created_by = ? AND '
+    .. M.invite_live_sql(t), acct.id).rows[1][1]
+  if live >= cap then
+    return 403, { error = { code = 'quota_exceeded',
+        message = 'this tier holds ' .. cap .. ' live invite code'
+          .. (cap == 1 and '' or 's') .. ' and this account has ' .. live
+          .. '; revoke one, wait for one to be used, or ask about a bigger tier' } }
+  end
+
+  local code, why = self:invite_insert(acct.id, f, '[]', t)
+  if not code then
+    return 503, { error = { code = 'code_unavailable', message = why } }
+  end
+
+  -- The PREFIX, never the code: the timeline is read by audiences the code
+  -- must not admit. The note stays out too -- it is where people write
+  -- "for jane@...", and detail walks past the audit mask whole.
+  self.events:log('invite.create', acct.id, acct, {
+    address = req.real_ip,
+    detail = { code_prefix = M.invite_prefix(code), max_uses = f.max_uses },
+  })
+
+  local r = self.drtdb.rows_by_name(self.db.query('SELECT ' .. M.INVITE_COLS
+    .. ' FROM invite WHERE code = ? LIMIT 1', code))[1]
+  return 201, '{"invite":' .. self:invite_json(r) .. '}'
+end
+
+-- Revoke. Own codes for everyone; an ADMIN may revoke anyone's -- as
+-- themselves, which is why the window refusal above can afford to point
+-- here. For the non-admin path, created_by in the WHERE is the
+-- authorization: someone else's code matches nothing and answers the same
+-- 404 as a code that never existed. A 403 would confirm the code is real,
+-- and a real code is redeemable -- this endpoint must not be the oracle the
+-- redeem limiter exists to shut.
+--
+-- A code with uses already spent still revokes: revocation stops the uses
+-- that REMAIN, and "my code leaked after the first use" is precisely the
+-- conversation this endpoint exists for. What it cannot do is un-create the
+-- accounts the spent uses made, and the row stays as the record of them.
+function Account:invites_delete(req, p)
+  local acct, status, payload = self:resolve_account(req)
+  if not acct then return status, payload end
+  local okay, s, pl = M.require_session(req, M.INVITE_SESSION)
+  if not okay then return s, pl end
+  local mine, ms, mpl = M.require_own_account(req, M.INVITE_REVOKE_ACT_AS)
+  if not mine then return ms, mpl end
+
+  local code = p and p.code or ''
+  local row
+  if acct.role == 'admin' then
+    row = self.drtdb.rows_by_name(self.db.query('SELECT ' .. M.INVITE_COLS
+      .. ' FROM invite WHERE code = ?1 LIMIT 1', code))[1]
+  else
+    row = self.drtdb.rows_by_name(self.db.query('SELECT ' .. M.INVITE_COLS
+      .. ' FROM invite WHERE code = ?1 AND created_by = ?2 LIMIT 1',
+      code, acct.id))[1]
+  end
+  -- Already-revoked answers 404 like the token route's does: the revocation
+  -- the caller wants does not exist to perform.
+  if not row or row.revoked_at then
+    return 404, { error = { code = 'not_found', message = 'no such invite' } }
+  end
+
+  -- revoked_at IS NULL in the WHERE, so two clicks race to one write; the
+  -- answer is the same either way and nothing depends on which one won.
+  self.db.exec('UPDATE invite SET revoked_at = ?1 WHERE code = ?2 AND revoked_at IS NULL',
+          self.now(), code)
+
+  -- SUBJECT is the code's creator -- an admin revoking a customer's code
+  -- lands on the customer's timeline saying staff did it, which is the
+  -- two-column split doing its one job. An operator code has no creator,
+  -- so the actor stands as its own subject.
+  self.events:log('invite.revoke', row.created_by or acct.id, acct, {
+    address = req.real_ip, detail = { code_prefix = M.invite_prefix(code) },
+  })
+
+  return 200, { revoked = true, code = code }
+end
+
+-- ======================================= depth: redeeming one, the stranger
+--
+-- An invite's stored confers, applied to an account as OFFERED grants. The
+-- entries were validated by validate_grant at mint; this re-checks shape
+-- only (a row can be written by the operator's shell) and deliberately does
+-- NOT re-run the future-expiry rule -- a tier_grant whose window has lapsed
+-- by redeem time lands born-expired, visible on /v1/me as "too late", which
+-- is honest where silently conferring nothing is not.
+--
+-- OFFERED, never redeemed: the panel's card is the moment of delight, and
+-- accepting a gift is the one verb in this feature that belongs to the
+-- person (grants_redeem's whole argument). Machinery that accepted on their
+-- behalf would spend that moment on nobody.
+function Account:apply_confers(acct, raw, source, t, addr)
+  local ok, arr = pcall(self.json.decode, raw)
+  if not ok or type(arr) ~= 'table' then return 0 end
+  local n = 0
+  for _, e in ipairs(arr) do
+    if type(e) == 'table' and type(e.kind) == 'string' and M.GRANT_KINDS[e.kind] then
+      local quantity = e.quantity
+      if type(quantity) ~= 'number' or quantity ~= math.floor(quantity)
+          or quantity < 0 or quantity > M.GRANT_QUANTITY_MAX then
+        quantity = 0
+      end
+      local g2 = {
+        kind = e.kind, quantity = quantity,
+        detail = type(e.detail) == 'table' and e.detail or {},
+        expires_at = (type(e.expires_at) == 'number'
+          and e.expires_at == math.floor(e.expires_at)) and e.expires_at or nil,
+      }
+      self:grant_insert(acct.id, g2, source, t)
+      -- grant.offer, exactly as the operator's door writes it, so the
+      -- timeline reads the same whichever way a gift arrived. The actor is
+      -- the account itself: they brought the code.
+      self.events:log('grant.offer', acct.id, acct, {
+        address = addr,
+        detail = { kind = g2.kind, quantity = g2.quantity, source = source },
+      })
+      n = n + 1
+    end
+  end
+  return n
+end
+
+-- POST /v1/redeem -- the architecturally different one, and the only place
+-- in the API that creates an account from a session rather than from an
+-- operator.
+--
+-- IT MUST NOT CALL resolve_account. Redemption is performed by a verified
+-- stranger: the gateway checked the JWT and asserted x-df-sub, and no
+-- account row exists -- exactly the caller resolve_account answers 403
+-- registration_closed, and that refusal is correct and stays for everything
+-- else. The dispatcher's gate only asks whether a CREDENTIAL is present, so
+-- a session reaches this handler; what the handler then does with req.sub is
+-- its own affair, and it takes it directly.
+--
+-- Because resolve_account never runs, act_as_apply never runs either, so the
+-- act-as refusal has to live here: silently serving a header the rest of the
+-- program honours is how an admin who believes they are acting as a customer
+-- redeems a code as a stranger.
+function Account:redeem_post(req, p)
+  -- Session only. Impersonated redemption is nonsense -- the window's
+  -- subject already HAS an account, and a stranger cannot be impersonated
+  -- because act-as addresses accounts. A token requires an account, so a
+  -- token holder is not the stranger this door exists for; the one who
+  -- already signed up redeems from the panel.
+  if req.act_as and req.act_as ~= '' then
+    return 403, { error = { code = 'act_as_forbidden',
+        message = 'redeeming an invite is done as yourself: a window\'s '
+          .. 'subject already has an account, and the grants a code confers '
+          .. 'outlive the window' } }
+  end
+  if M.opaque_token(req.authorization) then
+    return 403, { error = { code = 'session_required',
+        message = 'redeeming an invite needs a signed-in session: a token '
+          .. 'belongs to an account that already exists, and the code is '
+          .. 'redeemed by a person, in the panel' } }
+  end
+  if not req.sub then
+    -- The dispatcher's gate answers this before the handler runs; kept so
+    -- the handler stays correct if it is ever called from anywhere else.
+    return 401, { error = { code = 'unauthenticated',
+        message = 'no verified identity on this request' } }
+  end
+  req.via = 'session'
+
+  local us, up = self:unavailable()
+  if us then return us, up end
+
+  -- HARD, and BEFORE the database is touched. Keyed on x-real-ip only, the
+  -- waitlist's argument: a limiter keyed on a header the caller can seed is
+  -- a limiter the caller configures. Callers with no observation share one
+  -- bucket of the same size -- this is the one endpoint where the unknown
+  -- bucket must NOT be generous, because it is the oracle's front door.
+  -- The policy itself belongs to token-rate-limit-lib (M.POLICIES.redeem):
+  -- this library derives the key and spends the bucket on every attempt,
+  -- success included, and nothing more.
+  local who = (req.real_ip and req.real_ip ~= '') and req.real_ip or nil
+  local okr, rs, rp, rh = self.rate:check(
+    who and ('redeem:' .. who) or 'redeem:unknown',
+    self.rate.POLICIES.redeem,
+    'too many redemption attempts from this address')
+  if not okr then return rs, rp, rh end
+
+  local body = {}
+  if req.body and req.body ~= '' then
+    local ok, decoded = pcall(self.json.decode, req.body)
+    if not ok or type(decoded) ~= 'table' then
+      return 400, { error = { code = 'malformed_body',
+                              message = 'the body is not a JSON object' } }
+    end
+    body = decoded
+  end
+
+  local t = self.now()
+  local code = body.code
+  local inv
+  if type(code) == 'string' and code ~= '' and #code <= M.REDEEM_CODE_MAX then
+    inv = self.drtdb.rows_by_name(self.db.query('SELECT ' .. M.INVITE_COLS
+      .. ' FROM invite WHERE code = ? LIMIT 1', code))[1]
+  end
+  -- The four-way refusal, one condition and one answer. Nothing before the
+  -- account work below reads which clause fired, and nothing after this
+  -- line runs for any of the four.
+  if not inv or inv.revoked_at ~= nil
+      or (inv.expires_at ~= nil and inv.expires_at <= t)
+      or inv.used_count >= inv.max_uses then
+    return 404, M.INVITE_INVALID
+  end
+
+  -- The caller, by sub, directly. Either they exist -- someone who signed
+  -- up and then got a friend's code, and this is NOT registration, it is
+  -- applying the code's gifts to the account they have -- or they do not,
+  -- and the INSERT below is the account being born.
+  local aq = self.db.query('SELECT ' .. M.ACCOUNT_COLS
+    .. ' FROM account WHERE auth0_sub = ? LIMIT 1', req.sub)
+  local acct = self.drtdb.rows_by_name(aq)[1]
+  local created = false
+  if not acct then
+    -- The DURABLE CLAIM of the whole flow, and the UNIQUE on auth0_sub is
+    -- its atomicity: two redemptions racing for the same stranger both
+    -- reach this INSERT, the constraint refuses one, and the loser re-reads
+    -- and continues as the account holder it just became -- the
+    -- no-transactions race resolving itself. try_exec, because the refusal
+    -- is an outcome here, not an error.
+    local r = self.db.try_exec('INSERT INTO account (auth0_sub, created_at) VALUES (?, ?)',
+                          req.sub, t)
+    created = r ~= nil
+    acct = self.drtdb.rows_by_name(self.db.query('SELECT ' .. M.ACCOUNT_COLS
+      .. ' FROM account WHERE auth0_sub = ? LIMIT 1', req.sub))[1]
+    if not acct then
+      return 500, { error = { code = 'internal_error',
+          message = 'the account could not be created; the reason is in the log' } }
+    end
+  end
+  -- Suspension closes the control plane, and this is the control plane: an
+  -- account this system refuses does not collect gifts through the side
+  -- door. Checked AFTER the code lookup so a refused redemption burns no
+  -- use, and the same sentence resolve_account says.
+  if acct.suspended_at ~= nil then
+    return 403, { error = { code = 'account_suspended', message = M.SUSPENDED } }
+  end
+
+  -- What the code confers, offered. `source` carries the PREFIX for the
+  -- reason the events do: grants_redeem copies source into an event body
+  -- later, and this program has exactly one spelling of a code that may
+  -- travel that road.
+  self:apply_confers(acct, inv.confers, 'invite:' .. M.invite_prefix(inv.code), t,
+                req.real_ip)
+
+  -- The use, spent -- one statement, so the counter cannot lose an
+  -- increment to a concurrent redeemer. What CAN happen without
+  -- transactions is written down rather than discovered: two redemptions
+  -- of the last use both pass the read above and both land here, and the
+  -- code goes one over. That is a person let in slightly early -- the
+  -- cheapest failure a prelaunch has -- because max_uses is a throttle,
+  -- not a security boundary; the boundary is the account INSERT above.
+  self.db.exec('UPDATE invite SET used_count = used_count + 1 WHERE code = ?', inv.code)
+
+  -- account.create names its provenance and never the code: `detail` is
+  -- JSON inside a column and walks past the audit mask whole, so it gets
+  -- the prefix, same as every other event here.
+  if created then
+    self.events:log('account.create', acct.id, acct, {
+      address = req.real_ip,
+      detail = { source = 'invite', code_prefix = M.invite_prefix(inv.code) },
+    })
+  end
+  -- THE ADVOCATE'S RECEIPT. The subject is the code's CREATOR when it has
+  -- one, so the person whose invite worked sees it work -- on their own
+  -- timeline, as an action somebody else took, which is exactly what it
+  -- was. An operator code has no creator and the row lands on the new
+  -- account instead.
+  self.events:log('invite.redeem', inv.created_by or acct.id, acct, {
+    address = req.real_ip,
+    detail = { code_prefix = M.invite_prefix(inv.code) },
+  })
+
+  -- The same shape /v1/me answers -- through the same function, so it IS
+  -- that shape -- plus the one marker this endpoint owes the panel: the
+  -- page that follows a redemption opens on the cards the code conferred.
+  -- 201 when this request created the account, 200 for the account holder
+  -- who redeemed a friend's code; both bodies are the same shape.
+  local _, mb = self:me_body(req, acct)
+  return created and 201 or 200,
+         mb:sub(1, #mb - 1) .. ',"redeemed":true}'
+end
+
+-- ==================================================== depth: the rank ladder
+--
+-- Ranked rather than a set, so every check reads "at least this much" and
+-- inserting a role between two others does not mean revisiting every handler.
+function Account:require_role(req, min)
+  local acct, status, payload = self:resolve_account(req)
+  if not acct then return nil, status, payload end
+  if M.role_rank(acct.role) < M.ROLES[min] then
+    -- 'admin_required' is load-bearing rather than descriptive: it predates
+    -- this lattice and the panel and the battery both match on it by name.
+    local code, what = 'audit_required', 'an audit or admin account'
+    if min == 'admin' then code, what = 'admin_required', 'an admin account' end
+    return nil, 403, { error = { code = code,
+                                 message = 'this endpoint requires ' .. what } }
+  end
+  return acct
+end
+
+function Account:require_admin(req) return self:require_role(req, 'admin') end
+
+-- A TOKEN MAY READ A MACHINE VIEW; PERSONAL DATA DEMANDS A SESSION.
+--
+-- require_role inspects `acct.role` and nothing else, and resolve_account
+-- deliberately hands a token the SAME row a session gets -- so until this
+-- existed, a dfp_live_ token minted by an admin read every customer's
+-- address off /v1/admin/accounts.
+--
+-- The blanket fix -- require_session on every admin read -- was the wrong
+-- one, and expensively so: the nameserver's zone puller polls
+-- /v1/admin/resolve every thirty seconds with exactly such a token, and a
+-- session it cannot have would take the nameserver down. The line is not
+-- "which credential" but WHAT IS BEHIND THE ENDPOINT: labels and addresses
+-- about to be published in DNS are public by construction; accounts,
+-- waitlist and events name PEOPLE, and a credential that can be copied out
+-- of an env file must not be the thing standing between a leak and the
+-- customer list.
+function Account:require_person(req, min, why)
+  local acct, status, payload = self:require_role(req, min)
+  if not acct then return nil, status, payload end
+  local okay, s, pl = M.require_session(req, why or
+    'this view carries personal data and needs a signed-in session; a token '
+    .. 'reads the machine views (resolve, traffic, stats) and not this one')
+  if not okay then return nil, s, pl end
+  return acct
+end
+
+return M
